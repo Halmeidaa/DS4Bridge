@@ -9,6 +9,11 @@ if not exist "%PY%" (
     pause
     exit /b 1
 )
+if not exist "%~dp0instalar_drivers.ps1" (
+    echo ERRO: instalar_drivers.ps1 nao foi encontrado na pasta do projeto.
+    pause
+    exit /b 1
+)
 if not exist "DS4Bridge.pyw" (
     echo ERRO: o arquivo DS4Bridge.pyw nao foi encontrado nesta pasta.
     pause
@@ -37,6 +42,7 @@ echo Os arquivos do aplicativo serao empacotados sem alterar o driver instalado.
     --name DS4Bridge ^
     --collect-all customtkinter ^
     --collect-all vgamepad ^
+    --add-data "%~dp0instalar_drivers.ps1;." ^
     --hidden-import vgamepad ^
     --hidden-import hid ^
     --add-binary "%DLL64%;vgamepad/win/vigem/client/x64" ^

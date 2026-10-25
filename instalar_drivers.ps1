@@ -1,5 +1,9 @@
 # DS4 Bridge - assistente opcional dos drivers oficiais.
 # Usa releases oficiais, valida assinatura digital e pede confirmacao antes de instalar.
+param(
+    [ValidateSet('All', 'ViGEmBus', 'HidHide')]
+    [string]$Only = 'All'
+)
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
@@ -71,6 +75,7 @@ Write-Host 'HidHide: evita leitura duplicada do PS4 pelos jogos.'
 Write-Host 'Nada sera reinstalado sem necessidade ou sem sua confirmacao.'
 Write-Host ''
 
+if ($Only -eq 'All' -or $Only -eq 'ViGEmBus') {
 if (Presente-ViGEm) {
     Write-Host '[OK] ViGEmBus ja esta instalado. Nenhuma alteracao.' -ForegroundColor Green
 } elseif (Confirma 'o ViGEmBus') {
@@ -86,6 +91,9 @@ if (Presente-ViGEm) {
     Write-Host 'ViGEmBus ignorado a pedido do usuario.'
 }
 
+}
+
+if ($Only -eq 'All' -or $Only -eq 'HidHide') {
 if (Presente-HidHide) {
     Write-Host '[OK] HidHide ja esta instalado. Nenhuma alteracao.' -ForegroundColor Green
 } elseif ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne [Runtime.InteropServices.Architecture]::X64) {
@@ -102,6 +110,8 @@ if (Presente-HidHide) {
     }
 } else {
     Write-Host 'HidHide ignorado a pedido do usuario.'
+}
+
 }
 
 Write-Host ''

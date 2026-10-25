@@ -4,7 +4,7 @@ cd /d "%~dp0"
 title DS4 Bridge - Instalacao inicial
 
 echo ===========================================
-echo   DS4 BRIDGE 2.2.3 - INSTALACAO (1 VEZ)
+echo   DS4 BRIDGE 2.2.6 - INSTALACAO (1 VEZ)
 echo ===========================================
 echo.
 
