@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""DS4 Bridge 2.2.8 - adaptador USB DS4 -> XInput Xbox 360 no Windows.
+"""DS4 Bridge 2.2.9 - adaptador USB DS4 -> XInput Xbox 360 no Windows.
 
 Mantenha ViGEmBus; para eliminar o input duplicado instale HidHide e use
 'Ocultar controle fisico' em Configurar HidHide.
@@ -67,7 +67,7 @@ except Exception as exc:
     exibir_erro_inicio(exc)
     raise SystemExit(1) from exc
 
-VERSION = "2.2.8"
+VERSION = "2.2.9"
 VIGEM_URL = "https://github.com/nefarius/ViGEmBus/releases/tag/v1.22.0"
 HIDHIDE_URL = "https://github.com/nefarius/HidHide/releases"
 BG = "#0a0f19"
@@ -116,7 +116,7 @@ def stick(x: int, y: int, deadzone: float) -> tuple[float, float]:
     return (clipped(a * factor), clipped(b * factor))
 
 
-def parse_report(raw: list[int] | bytes, deadzone: float = 0.02) -> dict:
+def parse_report(raw: list[int] | bytes, deadzone: float = 0.0) -> dict:
     """Aceita HID USB DS4 0x01 e report curto equivalente de alguns clones.
 
     Nao adivinha outros layouts: transmitir offsets errados faz botoes aleatorios.
@@ -197,7 +197,7 @@ class Bridge:
         self.stop = threading.Event()
         self.thread: threading.Thread | None = None
         self.events = queue.SimpleQueue()
-        self.deadzone = 0.02
+        self.deadzone = 0.0
         self.state: dict | None = None
         self.virtual_state: dict | None = None
         self.virtual_on = False
@@ -331,6 +331,22 @@ class Bridge:
             self.events.put(("stopped", None))
 
 
+def hid_instance_key(path: str | bytes | None) -> str | None:
+    """Normaliza um caminho HID (hidapi ou HidHideCLI) para a mesma instância.
+
+    Não usar apenas VID/PID: dois controles iguais não podem ser confundidos.
+    """
+    if not path:
+        return None
+    if isinstance(path, bytes):
+        path = path.decode("utf-8", errors="replace")
+    path = str(path).strip().strip('"').replace('#', '\\').upper()
+    found = re.search(r"HID\\(VID_[0-9A-F]{4}&PID_[0-9A-F]{4}[^\\]*)\\([^\\{}]+)", path)
+    if not found:
+        return None
+    return found.group(1) + "\\" + found.group(2)
+
+
 class HidHide:
     """Consulta e edita APENAS a lista de HID selecionados via CLI oficial."""
     def __init__(self):
@@ -401,6 +417,40 @@ class HidHide:
         hidden = any(node.casefold() in line.casefold() for line in result.splitlines()
                      if line.strip().startswith("--dev-hide"))
         return cloaked, hidden
+
+    @staticmethod
+    def selected_hidden(cloak_output: str, devices_output: str, inverse_output: str,
+                        applications_output: str, selected_path: str | bytes | None,
+                        executable: str) -> bool:
+        """Ligado apenas com *esta instância* oculta e app autorizado.
+
+        Verifica configuração explícita, não a presença do driver nem só cloak-on.
+        Um controlador recém ocultado pode precisar ser reconectado para o
+        Windows efetivar o filtro (o assistente orienta sobre isso).
+        """
+        key = hid_instance_key(selected_path)
+        if not key or '--cloak-on' not in cloak_output or '--inv-off' not in inverse_output:
+            return False
+        registered = os.path.normcase(os.path.normpath(executable)).casefold()
+        if registered not in applications_output.casefold().replace('"', ''):
+            return False
+        for line in devices_output.splitlines():
+            match = re.search(r'--dev-hide\s+(.+)$', line, flags=re.I)
+            if match and hid_instance_key(match.group(1)) == key:
+                return True
+        return False
+
+    def selected_is_hidden(self, selected_path: str | bytes | None) -> bool:
+        if not selected_path:
+            return False
+        # CLI reports the *configuration*. Test selected entry, normal cloak mode
+        # and whitelist. Do not confuse a global cloak with an effective PS4 hide.
+        cloak = self.cmd('--cloak-state')
+        listed = self.cmd('--dev-list')
+        inverted = self.cmd('--inv-state')
+        apps = self.cmd('--app-list')
+        return self.selected_hidden(cloak, listed, inverted, apps,
+                                    selected_path, self.app_paths()[0])
 
     def set_hidden(self, node: str, hide: bool) -> tuple[bool, bool]:
         if not re.match(r"^HID\\[\w&{}\-\\]+$", node, flags=re.I):
@@ -633,8 +683,9 @@ class App(ctk.CTk):
         ctk.set_default_color_theme("blue")
         super().__init__()
         self.title(f"DS4 Bridge {VERSION}  |  PS4 → Xbox 360")
-        self.geometry("1160x810")
-        self.minsize(1000, 720)
+        self.set_initial_geometry()
+        self.minsize(min(780, self._initial_size[0]),
+                     min(480, self._initial_size[1]))
         self.configure(fg_color=BG)
         self.bridge = Bridge()
         self.hiding = HidHide()
@@ -648,17 +699,52 @@ class App(ctk.CTk):
         self.warning = False
         self.hide_checking = False
         self.hide_state = "verificando"
-        self.hide_global = "checking"
+        self.hide_global = "off"
+        self.hide_pending_path = None
+        self.hide_seen_disconnected = False
         self._wheel_remainder = 0.0
         self._drag_canvas = None
         self._drag_last_y = 0
         self._drag_remainder = 0.0
-        self.vars = {"deadzone": ctk.DoubleVar(value=2.0)}
+        self.vars = {"deadzone": ctk.DoubleVar(value=0.0)}
         self.make_ui()
         self.after(150, self.scan_tick)
         self.after(450, self.hidhide_status_tick)
         self.after(50, self.refresh)
         self.protocol("WM_DELETE_WINDOW", self.close)
+
+    @staticmethod
+    def usable_window_size(screen_w: int, screen_h: int, scale: float = 1.0) -> tuple[int, int]:
+        """Limita a janela à área útil, já considerando escala do Windows/Tk."""
+        scale = max(0.75, float(scale or 1.0))
+        available_w, available_h = max(1, int(screen_w / scale)), max(1, int(screen_h / scale))
+        w = min(1160, max(1, int(available_w * 0.94)))
+        h = min(850, max(1, int(available_h * 0.93)))
+        return (w, h)
+
+    def set_initial_geometry(self):
+        # Área útil exclui a barra de tarefas. O fallback usa tamanho da tela.
+        screen_w, screen_h = self.winfo_screenwidth(), self.winfo_screenheight()
+        left, top = 0, 0
+        if sys.platform == 'win32':
+            try:
+                class RECT(ctypes.Structure):
+                    _fields_ = [('left', ctypes.c_long), ('top', ctypes.c_long),
+                                ('right', ctypes.c_long), ('bottom', ctypes.c_long)]
+                area = RECT()
+                if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(area), 0):
+                    left, top = area.left, area.top
+                    screen_w = area.right - area.left
+                    screen_h = area.bottom - area.top
+            except (AttributeError, OSError, ValueError):
+                pass
+        scale = self._get_window_scaling() if hasattr(self, '_get_window_scaling') else 1.0
+        width, height = self.usable_window_size(screen_w, screen_h, scale)
+        self._initial_size = (width, height)
+        # CTk aplica scale à geometria internamente.
+        x = int((left + (screen_w - width * scale) / 2) / scale)
+        y = int((top + (screen_h - height * scale) / 2) / scale)
+        self.geometry(f'{width}x{height}+{max(x, 0)}+{max(y, 0)}')
 
     def title_label(self, parent, text, small=False):
         return ctk.CTkLabel(parent, text=text, font=(FONT, 13 if small else 17, "bold"),
@@ -810,63 +896,49 @@ class App(ctk.CTk):
         return None
 
     @staticmethod
-    def hidhide_message(global_state: str, mode: str) -> tuple[str, str]:
-        """Estado real do driver e estado da conversão são coisas diferentes.
+    def hidhide_message(status: str) -> tuple[str, str]:
+        """Não declarar a ocultação ligada sem confirmar este controle PS4."""
+        if status == 'on':
+            return '●   HidHide: Ligado · PS4 ocultado', GREEN
+        if status == 'pending':
+            return '●   HidHide: Desligado · reconecte o PS4', AMBER
+        if status == 'missing':
+            return '●   HidHide: Não instalado', AMBER
+        if status == 'unavailable':
+            return '●   HidHide: estado não confirmado', AMBER
+        return '●   HidHide: Desligado', MUTED
 
-        O HidHide continua habilitado no Windows até ser desligado; não deve
-        aparecer como conversão ativa quando o Xbox virtual está desligado.
-        """
-        if global_state == 'missing':
-            return 'HidHide não instalado', AMBER
-        if global_state == 'unavailable':
-            return 'HidHide: estado indisponível', AMBER
-        if global_state == 'no_cli':
-            return 'HidHide instalado · não foi possível consultar', AMBER
-        if global_state == 'off':
-            return 'HidHide desativado no Windows', AMBER
-        if global_state != 'on':
-            return 'HidHide: verificando...', MUTED
-        if mode == 'virtual':
-            # Ligado não garante que ESTE controle esteja na lista ocultada.
-            return 'HidHide ligado no Windows · conversão ativa', GREEN
-        if mode == 'test':
-            return 'HidHide configurado · somente teste USB', MUTED
-        if mode == 'starting':
-            return 'HidHide configurado · preparando conversão', MUTED
-        return 'HidHide configurado · conversão parada', MUTED
-
-    def update_hidhide_labels(self, global_state=None):
-        if global_state is not None:
-            self.hide_global = global_state
-        message, color = self.hidhide_message(self.hide_global, self.bridge.mode)
+    def update_hidhide_labels(self, state=None):
+        if state is not None:
+            self.hide_global = state
+        effective = ('pending' if self.hide_pending_path and self.hide_global == 'on'
+                     else self.hide_global)
+        message, color = self.hidhide_message(effective)
         self.hide_state = message
         for item in (self.hide_status, self.warning_label):
             item.configure(text=message, text_color=color)
 
     def hidhide_status_tick(self):
-        """Consulta o estado global no Windows em segundo plano, sem travar UI."""
+        """Confere a ocultação para o PS4 selecionado, fora da thread da UI."""
         if self.shutdown:
             return
         if not self.hide_checking:
             self.hide_checking = True
+            selected = self.selected_path
             def check():
                 try:
                     reader = HidHide()
                     if not reader.cli:
-                        state = 'no_cli' if driver_installed('HidHide') else 'missing'
+                        state = 'missing' if not driver_installed('HidHide') else 'unavailable'
+                    elif not selected:
+                        state = 'off'
                     else:
-                        raw = reader.cmd('--cloak-state')
-                        if '--cloak-on' in raw:
-                            state = 'on'
-                        elif '--cloak-off' in raw:
-                            state = 'off'
-                        else:
-                            state = 'unavailable'
-                    self.bridge.events.put(('hidhide_state', state))
+                        state = 'on' if reader.selected_is_hidden(selected) else 'off'
+                    self.bridge.events.put(('hidhide_state', (selected, state)))
                 except Exception:
-                    self.bridge.events.put(('hidhide_state', 'unavailable'))
+                    self.bridge.events.put(('hidhide_state', (selected, 'unavailable')))
             threading.Thread(target=check, daemon=True).start()
-        self.after(5000, self.hidhide_status_tick)
+        self.after(3500, self.hidhide_status_tick)
 
     def make_sidebar(self, parent):
         box = self.card(parent)
@@ -904,7 +976,7 @@ class App(ctk.CTk):
         self.button(svc, "Configurar HidHide", self.hidhide_dialog).pack(fill="x", pady=(0, 9))
         self.button(svc, "Testar no Windows", self.joy).pack(fill="x", pady=(0, 9))
         self.button(svc, "Verificar drivers", self.drivers_dialog).pack(fill="x")
-        self.hide_status = self.text_label(svc, "HidHide: verificando...", size=11, wrap=270)
+        self.hide_status = self.text_label(svc, "●   HidHide: Desligado", size=11, wrap=270)
         self.hide_status.pack(anchor="w", pady=(13, 0))
 
     def make_content(self, parent):
@@ -922,7 +994,7 @@ class App(ctk.CTk):
         self.text_label(inner, "Estimativa: 1000 ÷ relatórios/s. Não é a latência total do jogo.",
                         size=10, wrap=630).pack(anchor="w", pady=(9, 0))
         self.warning_label = self.text_label(inner,
-            "HidHide: verificando estado...",
+            "●   HidHide: Desligado",
             color=MUTED, size=11, wrap=600)
         self.warning_label.pack(anchor="w", pady=(14, 0))
 
@@ -949,7 +1021,7 @@ class App(ctk.CTk):
         ad = ctk.CTkFrame(adjust, fg_color="transparent")
         ad.pack(fill="x", padx=18, pady=16)
         self.title_label(ad, "AJUSTE DOS ANALÓGICOS").pack(anchor="w", pady=(0, 13))
-        self.dead_text = self.text_label(ad, "Zona morta radial: 2%", color=TEXT)
+        self.dead_text = self.text_label(ad, "Zona morta radial: 0%", color=TEXT)
         self.dead_text.pack(anchor="w")
         self.slider = ctk.CTkSlider(ad, from_=0, to=20, number_of_steps=20, variable=self.vars["deadzone"],
             progress_color=CYAN, button_color=CYAN, button_hover_color="#a3fff1",
@@ -960,7 +1032,7 @@ class App(ctk.CTk):
         for control in (self.slider, self.slider._canvas):
             for event_name in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
                 control.bind(event_name, self.scroll_with_wheel, add="+")
-        self.text_label(ad, "Padrão: 2%. Ajuste somente arrastando o controle deslizante.", size=11).pack(anchor="w")
+        self.text_label(ad, "Padrão: 0%. Ajuste somente arrastando o controle deslizante.", size=11).pack(anchor="w")
 
 
     def metric(self, parent, column, heading, initial):
@@ -986,13 +1058,15 @@ class App(ctk.CTk):
         for i, d in enumerate(self.devices):
             if name_for(d, i) == label:
                 self.selected_path = d["path"]
+                self.update_hidhide_labels('off')
                 break
 
     def scan_tick(self):
         if self.shutdown:
             return
         self.scan()
-        self.after(2500, self.scan_tick)
+        # Enquanto aguarda reconexão, detecta rapidamente a remoção/reentrada USB.
+        self.after(500 if self.hide_pending_path else 2500, self.scan_tick)
 
     def scan(self):
         # A enumeração HID pode bloquear: nunca rodar na thread da interface.
@@ -1019,8 +1093,16 @@ class App(ctk.CTk):
         old_paths=[d["path"] for d in self.devices]
         new_paths=[d["path"] for d in found]
         self.devices=found
+        if self.hide_pending_path is not None:
+            if self.hide_pending_path not in new_paths:
+                self.hide_seen_disconnected = True
+            elif self.hide_seen_disconnected:
+                self.hide_pending_path = None
+                self.hide_seen_disconnected = False
         if old_path not in new_paths:
             self.selected_path=new_paths[0] if new_paths else None
+        if old_path != self.selected_path:
+            self.update_hidhide_labels('off')
         names=[name_for(d,i) for i,d in enumerate(found)]
         options=names or ["Nenhum controle conectado"]
         self.combo.configure(values=options)
@@ -1191,6 +1273,8 @@ class App(ctk.CTk):
                     return
             context["busy"] = True
             if operation != "scan":
+                context["selected_node"] = selected_node
+            if operation != "scan":
                 status.configure(text="Aplicando configuração do HidHide...", text_color=CYAN)
             def worker():
                 try:
@@ -1223,7 +1307,9 @@ class App(ctk.CTk):
     def event(self, name, data):
         if name == "hidhide_state":
             self.hide_checking = False
-            self.update_hidhide_labels(data)
+            selected, state = data
+            if selected == self.selected_path:
+                self.update_hidhide_labels(state)
             return
         if name == "scan_result":
             self.device_result(data)
@@ -1276,7 +1362,19 @@ class App(ctk.CTk):
                 cloaked, listed = result
                 label.configure(text=("PS4 incluído no HidHide. Reconecte o USB para aplicar."
                          if listed else "PS4 removido da lista. Reconecte o USB para aplicar."), text_color=GREEN)
-                self.update_hidhide_labels("on" if cloaked else "off")
+                # A opção foi gravada, mas ainda não afirmamos que o filtro
+                # está efetivo: é preciso reconectar o USB.
+                if listed and hid_instance_key(context.get('selected_node')) == hid_instance_key(self.selected_path):
+                    self.hide_pending_path = self.selected_path
+                    self.hide_seen_disconnected = False
+                    self.update_hidhide_labels('on')
+                elif listed:
+                    self.hide_pending_path = None
+                    self.update_hidhide_labels('off')
+                else:
+                    self.hide_pending_path = None
+                    self.hide_seen_disconnected = False
+                    self.update_hidhide_labels('off')
                 self.banner("Configuração salva. Reconecte o controle para aplicar a alteração.")
             return
         if name == "active":
