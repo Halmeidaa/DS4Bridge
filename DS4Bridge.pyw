@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""DS4 Bridge 2.0 - adaptador USB DS4 -> XInput Xbox 360 no Windows.
+"""DS4 Bridge 2.2.5 - adaptador USB DS4 -> XInput Xbox 360 no Windows.
 
 Mantenha ViGEmBus; para eliminar o input duplicado instale HidHide e use
 'Ocultar controle fisico' em Configurar HidHide.
@@ -62,7 +62,7 @@ except Exception as exc:
     exibir_erro_inicio(exc)
     raise SystemExit(1) from exc
 
-VERSION = "2.2.1"
+VERSION = "2.2.5"
 VIGEM_URL = "https://github.com/nefarius/ViGEmBus/releases/tag/v1.22.0"
 HIDHIDE_URL = "https://github.com/nefarius/HidHide/releases"
 BG = "#0a0f19"
@@ -198,8 +198,8 @@ class Bridge:
         self.virtual_on = False
         self.connected = False
         self.report_time = 0.0
-        self.fps = 0
-        self.report_size = 0
+        self.fps = 0.0
+        self.interval_ms = None
         self.mode = "idle"
 
     def launch(self, path: bytes, virtual: bool) -> None:
@@ -209,6 +209,8 @@ class Bridge:
         self.connected = False
         self.virtual_on = False
         self.mode = "starting"
+        self.fps = 0.0
+        self.interval_ms = None
         self.thread = threading.Thread(target=self.run, args=(path, virtual), daemon=True)
         self.thread.start()
 
@@ -233,10 +235,16 @@ class Bridge:
                     import vgamepad as vg
                     pad = vg.VX360Gamepad()
                 except Exception as exc:
-                    raise RuntimeError(
-                        "Nao foi possivel criar o Xbox virtual. Confira ViGEmBus, "
-                        f"vgamepad e reinicie o computador. Detalhes: {exc}"
-                    ) from exc
+                    detalhe = str(exc)
+                    texto = detalhe.lower()
+                    if "vigemclient.dll" in texto or "failed to load dynlib" in texto:
+                        motivo = ("O executavel nao encontrou a biblioteca ViGEmClient.dll. "
+                                  "Gere o EXE com o criar_exe.bat atualizado.")
+                    elif "vigem_error_bus_not_found" in texto or "0xe0000001" in texto:
+                        motivo = "O driver ViGEmBus nao foi localizado pelo Windows."
+                    else:
+                        motivo = "Nao foi possivel criar o controle Xbox 360 virtual."
+                    raise RuntimeError(f"{motivo} Detalhes: {detalhe}") from exc
             self.mode = "virtual" if pad else "test"
             self.virtual_on = pad is not None
             self.events.put(("active", output))
@@ -251,6 +259,10 @@ class Bridge:
                     if now - last_rx > 0.65 and self.connected:
                         self.connected = False
                         self.state = self.virtual_state = None
+                        self.fps = 0.0
+                        self.interval_ms = None
+                        count = 0
+                        last_sample = now
                         if pad:
                             pad.reset()
                             pad.update()
@@ -267,14 +279,17 @@ class Bridge:
                         raise ValueError(str(exc)) from exc
                     continue
                 rejected = 0
-                self.report_size = len(raw)
                 last_rx = now
                 if not self.connected:
                     self.connected = True
                     self.events.put(("receiving", None))
                 count += 1
                 if now - last_sample >= 1.0:
-                    self.fps = round(count / (now - last_sample))
+                    elapsed = now - last_sample
+                    self.fps = count / elapsed
+                    # A media do periodo HID e derivada da frequencia observada.
+                    # Nao mede a latencia total entre o controle e o jogo.
+                    self.interval_ms = 1000.0 / self.fps if self.fps > 0 else None
                     last_sample, count = now, 0
                 self.report_time = now
                 self.state = state
@@ -306,6 +321,8 @@ class Bridge:
             self.mode = "idle"
             self.connected = self.virtual_on = False
             self.state = self.virtual_state = None
+            self.fps = 0.0
+            self.interval_ms = None
             self.events.put(("stopped", None))
 
 
@@ -590,7 +607,7 @@ class App(ctk.CTk):
         ctk.set_appearance_mode("Dark")
         ctk.set_default_color_theme("blue")
         super().__init__()
-        self.title("DS4 Bridge 2.2.1  |  PS4 → Xbox 360")
+        self.title(f"DS4 Bridge {VERSION}  |  PS4 → Xbox 360")
         self.geometry("1160x810")
         self.minsize(1000, 720)
         self.configure(fg_color=BG)
@@ -690,24 +707,11 @@ class App(ctk.CTk):
         self.stop.pack(fill="x")
         self.stop.configure(state="disabled")
 
-        adjust = self.card(parent)
-        adjust.pack(fill="x", pady=(0, 13))
-        ad = ctk.CTkFrame(adjust, fg_color="transparent")
-        ad.pack(fill="x", padx=18, pady=16)
-        self.title_label(ad, "02   ANALÓGICOS").pack(anchor="w", pady=(0, 13))
-        self.dead_text = self.text_label(ad, "Zona morta radial: 2%", color=TEXT)
-        self.dead_text.pack(anchor="w")
-        self.slider = ctk.CTkSlider(ad, from_=0, to=20, number_of_steps=20, variable=self.vars["deadzone"],
-            progress_color=CYAN, button_color=CYAN, button_hover_color="#a3fff1",
-            fg_color=BORDER, command=self.dead_change)
-        self.slider.pack(fill="x", pady=(8, 5))
-        self.text_label(ad, "Padrão: 2%. Sem suavização artificial nem atraso adicional.", size=11).pack(anchor="w")
-
         services = self.card(parent)
         services.pack(fill="x", pady=(0, 5))
         svc = ctk.CTkFrame(services, fg_color="transparent")
         svc.pack(fill="x", padx=18, pady=17)
-        self.title_label(svc, "03   COMPATIBILIDADE").pack(anchor="w", pady=(0, 12))
+        self.title_label(svc, "02   COMPATIBILIDADE").pack(anchor="w", pady=(0, 12))
         self.button(svc, "Configurar HidHide", self.hidhide_dialog).pack(fill="x", pady=(0, 9))
         self.button(svc, "Testar no Windows", self.joy).pack(fill="x", pady=(0, 9))
         self.button(svc, "Site do driver ViGEmBus", lambda: webbrowser.open(VIGEM_URL)).pack(fill="x")
@@ -722,11 +726,12 @@ class App(ctk.CTk):
         self.title_label(inner, "VISÃO GERAL   /   MONITOR EM TEMPO REAL").pack(anchor="w", pady=(0, 12))
         badges = ctk.CTkFrame(inner, fg_color="transparent")
         badges.pack(fill="x")
-        for col in (0, 1, 2):
+        for col in (0, 1):
             badges.grid_columnconfigure(col, weight=1)
-        self.rate = self.metric(badges, 0, "RELATÓRIOS / S", "—")
-        self.latency = self.metric(badges, 1, "HID USB", "—")
-        self.signal = self.metric(badges, 2, "SAÍDA XINPUT", "OFF")
+        self.rate = self.metric(badges, 0, "INTERVALO HID / MS", "—")
+        self.signal = self.metric(badges, 1, "SAÍDA XINPUT", "OFF")
+        self.text_label(inner, "Estimativa: 1000 ÷ relatórios/s. Não é a latência total do jogo.",
+                        size=10, wrap=630).pack(anchor="w", pady=(9, 0))
         self.warning_label = self.text_label(inner,
             "Se o jogo alternar entre mouse e controle, configure a ocultação do PS4 físico no HidHide.",
             color=AMBER, size=11, wrap=600)
@@ -750,6 +755,26 @@ class App(ctk.CTk):
         self.last_action = self.text_label(mc, "Aguardando comandos do controle…", color=MUTED, size=11, wrap=670)
         self.last_action.pack(anchor="w", pady=(0, 4))
 
+        adjust = self.card(parent)
+        adjust.pack(fill="x", pady=(0, 6))
+        ad = ctk.CTkFrame(adjust, fg_color="transparent")
+        ad.pack(fill="x", padx=18, pady=16)
+        self.title_label(ad, "AJUSTE DOS ANALÓGICOS").pack(anchor="w", pady=(0, 13))
+        self.dead_text = self.text_label(ad, "Zona morta radial: 2%", color=TEXT)
+        self.dead_text.pack(anchor="w")
+        self.slider = ctk.CTkSlider(ad, from_=0, to=20, number_of_steps=20, variable=self.vars["deadzone"],
+            progress_color=CYAN, button_color=CYAN, button_hover_color="#a3fff1",
+            fg_color=BORDER, command=self.dead_change)
+        self.slider.pack(fill="x", pady=(8, 5))
+        # Bloqueia a rodinha APENAS neste ajuste, sem afetar o arraste do slider.
+        # CustomTkinter desenha o CTkSlider em um Canvas interno.
+        # Interceptar tanto o componente quanto o Canvas evita mudancas por scroll.
+        for control in (self.slider, self.slider._canvas):
+            for event_name in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                control.bind(event_name, self._ignore_deadzone_wheel, add="+")
+        self.text_label(ad, "Padrão: 2%. Ajuste somente arrastando o controle deslizante.", size=11).pack(anchor="w")
+
+
     def metric(self, parent, column, heading, initial):
         frame = ctk.CTkFrame(parent, fg_color=PANEL_LIGHT, corner_radius=10)
         frame.grid(row=0, column=column, sticky="ew", padx=(0 if column == 0 else 5, 5 if column < 2 else 0))
@@ -762,6 +787,11 @@ class App(ctk.CTk):
     def banner(self, value: str, error=False):
         self.banner_label.configure(text="  " + value, text_color=RED if error else TEXT,
                                     fg_color="#38212e" if error else PANEL_LIGHT)
+
+    @staticmethod
+    def _ignore_deadzone_wheel(_event):
+        """Impede que o scroll do mouse altere a zona morta."""
+        return "break"
 
     def dead_change(self, value: float):
         value = round(value)
@@ -1012,8 +1042,8 @@ class App(ctk.CTk):
             if not self.shutdown:
                 self.event(name, data)
         state=self.bridge.state
-        self.rate.configure(text=str(self.bridge.fps) if state else "—")
-        self.latency.configure(text=f"{self.bridge.report_size} B" if state else "—")
+        self.rate.configure(text=f"{self.bridge.interval_ms:.1f} ms"
+                            if state and self.bridge.interval_ms is not None else "—")
         if state:
             pressed=[name for name,bit in KEYS if state["buttons"] & bit]
             self.probed.update(name for name,bit in KEYS if state["buttons"] & bit)
