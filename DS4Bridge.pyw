@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""DS4 Bridge 2.2.9 - adaptador USB DS4 -> XInput Xbox 360 no Windows.
+"""DS4 Bridge 2.3.1 - adaptador USB DS4 -> XInput Xbox 360 no Windows.
 
 Mantenha ViGEmBus; para eliminar o input duplicado instale HidHide e use
 'Ocultar controle fisico' em Configurar HidHide.
@@ -67,7 +67,7 @@ except Exception as exc:
     exibir_erro_inicio(exc)
     raise SystemExit(1) from exc
 
-VERSION = "2.2.9"
+VERSION = "2.3.1"
 VIGEM_URL = "https://github.com/nefarius/ViGEmBus/releases/tag/v1.22.0"
 HIDHIDE_URL = "https://github.com/nefarius/HidHide/releases"
 BG = "#0a0f19"
@@ -492,6 +492,196 @@ def bundled_path(file_name: str) -> Path:
     return bundle / file_name
 
 
+# Preferências são locais ao usuário. A inicialização automática é registrada
+# somente em HKCU (sem tarefa agendada, serviço ou privilégios de administrador).
+SETTINGS_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "DS4Bridge"
+SETTINGS_FILE = SETTINGS_DIR / "config.json"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_VALUE = "DS4Bridge"
+
+
+def read_settings() -> dict:
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def save_settings(values: dict) -> None:
+    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+    temporary = SETTINGS_FILE.with_suffix('.tmp')
+    temporary.write_text(json.dumps(values, ensure_ascii=False, indent=2), encoding='utf-8')
+    temporary.replace(SETTINGS_FILE)
+
+
+def startup_command() -> str:
+    # No executável usa o próprio .exe; no código usa pythonw.exe + .pyw.
+    if getattr(sys, 'frozen', False):
+        return f'"{Path(sys.executable).resolve()}"'
+    executable = Path(sys.executable).resolve()
+    if executable.name.lower() == 'python.exe' and executable.with_name('pythonw.exe').exists():
+        executable = executable.with_name('pythonw.exe')
+    return f'"{executable}" "{Path(__file__).resolve()}"'
+
+
+def set_windows_autostart(enable: bool) -> None:
+    if winreg is None:
+        raise RuntimeError('A inicialização automática requer Windows.')
+    # Abrir com KEY_SET_VALUE não requer elevação para HKCU.
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enable:
+            winreg.SetValueEx(key, RUN_VALUE, 0, winreg.REG_SZ, startup_command())
+        else:
+            try:
+                winreg.DeleteValue(key, RUN_VALUE)
+            except FileNotFoundError:
+                pass
+
+
+def select_restart_instance(instance_id: str, usb_parent: str | None = None) -> str:
+    """Reiniciar só a interface HID escolhida, NUNCA a porta USB pai.
+
+    Reiniciar o pai USB interrompia alguns DS4 paralelos até o cabo ser removido.
+    O parâmetro usb_parent é ignorado por compatibilidade com versões anteriores.
+    """
+    if not re.fullmatch(r'HID\\[A-Za-z0-9_&{}\\#.-]+', instance_id, flags=re.I):
+        raise ValueError('Instância HID inválida. O dispositivo não será reiniciado.')
+    if 'VID_045E' in instance_id.upper():
+        raise ValueError('O Xbox virtual não pode ser reiniciado.')
+    return instance_id
+
+
+def restart_only_hid_device(instance_id: str, usb_parent: str | None = None) -> None:
+    """Pede ao Windows para reiniciar a interface HID (UAC), não o controlador USB.
+
+    Código de saída 0 significa que o comando terminou, NÃO que o controle
+    voltou a responder. A confirmação real é feita em check_controller_input().
+    """
+    if sys.platform != 'win32':
+        raise RuntimeError('A reconexão automática exige Windows.')
+    target = select_restart_instance(instance_id)
+    from ctypes import wintypes
+
+    class SHELLEXECUTEINFOW(ctypes.Structure):
+        _fields_ = [
+            ('cbSize', wintypes.DWORD), ('fMask', wintypes.ULONG),
+            ('hwnd', wintypes.HWND), ('lpVerb', wintypes.LPCWSTR),
+            ('lpFile', wintypes.LPCWSTR), ('lpParameters', wintypes.LPCWSTR),
+            ('lpDirectory', wintypes.LPCWSTR), ('nShow', ctypes.c_int),
+            ('hInstApp', wintypes.HINSTANCE), ('lpIDList', ctypes.c_void_p),
+            ('lpClass', wintypes.LPCWSTR), ('hkeyClass', wintypes.HKEY),
+            ('dwHotKey', wintypes.DWORD), ('hIcon', wintypes.HANDLE),
+            ('hProcess', wintypes.HANDLE),
+        ]
+
+    executable = str(Path(os.environ.get('WINDIR', r'C:\Windows')) / 'System32' / 'pnputil.exe')
+    shell = ctypes.WinDLL('shell32', use_last_error=True)
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    shell.ShellExecuteExW.argtypes = [ctypes.POINTER(SHELLEXECUTEINFOW)]
+    shell.ShellExecuteExW.restype = wintypes.BOOL
+    kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel.WaitForSingleObject.restype = wintypes.DWORD
+    kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    info = SHELLEXECUTEINFOW()
+    info.cbSize = ctypes.sizeof(info)
+    info.fMask = 0x00000040  # SEE_MASK_NOCLOSEPROCESS
+    info.lpVerb = 'runas'  # o usuário confirma a operação pelo Windows
+    info.lpFile = executable
+    info.lpParameters = f'/restart-device "{target}"'
+    info.nShow = 0
+    if not shell.ShellExecuteExW(ctypes.byref(info)):
+        code = ctypes.get_last_error()
+        if code == 1223:
+            raise RuntimeError('Permissão de administrador cancelada.')
+        raise OSError(code, f'O Windows não autorizou o reinício (erro {code}).')
+    try:
+        wait = kernel.WaitForSingleObject(info.hProcess, 60000)
+        if wait != 0:
+            raise RuntimeError('O Windows não concluiu a operação em até 60 segundos.')
+        code = wintypes.DWORD()
+        if not kernel.GetExitCodeProcess(info.hProcess, ctypes.byref(code)) or code.value != 0:
+            raise RuntimeError(f'O Windows não reiniciou a interface HID (código {code.value}).')
+    finally:
+        kernel.CloseHandle(info.hProcess)
+
+
+def check_controller_input(instance_id: str, timeout: float = 8.0,
+                           poll_interval: float = 0.35) -> bool:
+    """Confirma leitura HID real DESTA instância, após a tentativa de reinício.
+
+    Não confunde a enumeração do HID nem o retorno do pnputil com reconexão.
+    Só retorna True depois de receber um relatório de entrada do dispositivo.
+    """
+    import hid
+    key = hid_instance_key(instance_id)
+    if not key:
+        return False
+    deadline = time.monotonic() + max(0, timeout)
+    while True:
+        try:
+            devices = hid.enumerate()
+        except (OSError, RuntimeError):
+            devices = []
+        for info in devices:
+            path = info.get('path')
+            if not path or hid_instance_key(path) != key or not maybe_controller(info):
+                continue
+            dev = None
+            try:
+                dev = hid.device()
+                dev.open_path(path)
+                # Confirma um relatório real como o esperado pelo Bridge.
+                report = dev.read(64, 180)
+                if report and report[0] == 0x01 and len(report) >= 10:
+                    return True
+            except (OSError, RuntimeError, ValueError):
+                pass
+            finally:
+                if dev is not None:
+                    try:
+                        dev.close()
+                    except OSError:
+                        pass
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
+
+
+def apply_hide_checked(hider: HidHide, instance_id: str, hide: bool,
+                       restart=restart_only_hid_device,
+                       probe=check_controller_input) -> dict:
+    """Altera HidHide e verifica leitura antes de anunciar reconexão.
+
+    Se a ocultação recém solicitada tornar o dispositivo inacessível,
+    a entrada desse dispositivo é removida da lista de ocultação.
+    Outros dispositivos e a configuração global não são alterados.
+    """
+    hider.set_hidden(instance_id, hide)
+    try:
+        restart(instance_id)
+        if not probe(instance_id):
+            raise RuntimeError('O controle não voltou a enviar dados HID após o reinício.')
+        if hide and not hider.selected_is_hidden(instance_id):
+            raise RuntimeError('Não foi possível confirmar a autorização do DS4 Bridge no HidHide.')
+        return {'ok': True, 'hidden': hide, 'reverted': False, 'detail': ''}
+    except Exception as exc:
+        message = str(exc)
+        reverted = False
+        try:
+            # Mesmo quando já estava oculto, priorize recuperar a leitura.
+            # Em "Mostrar", manter desocultado também é a escolha mais segura.
+            hider.set_hidden(instance_id, False)
+            reverted = True
+        except Exception as undo_exc:
+            message += f' Não foi possível retirar a ocultação: {undo_exc}'
+        return {'ok': False, 'hidden': False if reverted else hide,
+                'reverted': reverted, 'detail': message}
+
+
 def name_for(d: dict, idx: int) -> str:
     name = d.get("product_string") or "Controle PS4 compativel"
     return f"{idx + 1:02d}  ·  {name}  [{d.get('vendor_id', 0):04X}:{d.get('product_id', 0):04X}]"
@@ -706,7 +896,20 @@ class App(ctk.CTk):
         self._drag_canvas = None
         self._drag_last_y = 0
         self._drag_remainder = 0.0
-        self.vars = {"deadzone": ctk.DoubleVar(value=0.0)}
+        self.settings = read_settings()
+        self.auto_enabled = bool(self.settings.get('auto_convert', False))
+        self.auto_paused = False  # botão Parar suspende até reiniciar o app ou clicar Iniciar
+        self.auto_next_attempt = 0.0
+        self.auto_last_error = False
+        self.hide_config_open = False
+        self.vars = {"deadzone": ctk.DoubleVar(value=0.0),
+                     "auto": ctk.BooleanVar(value=self.auto_enabled)}
+        if self.auto_enabled:
+            # Atualiza o caminho caso o usuário tenha movido a pasta/EXE.
+            try:
+                set_windows_autostart(True)
+            except OSError:
+                pass
         self.make_ui()
         self.after(150, self.scan_tick)
         self.after(450, self.hidhide_status_tick)
@@ -967,6 +1170,16 @@ class App(ctk.CTk):
         self.stop = self.button(inner, "Parar conversão", self.stop_bridge)
         self.stop.pack(fill="x")
         self.stop.configure(state="disabled")
+        self.auto_box = ctk.CTkCheckBox(inner,
+            text="Converter automaticamente",
+            variable=self.vars['auto'], command=self.toggle_auto,
+            text_color=TEXT, font=(FONT, 12), checkbox_width=19,
+            checkbox_height=19, border_color=BORDER, fg_color=CYAN,
+            hover_color=CYAN)
+        self.auto_box.pack(anchor="w", pady=(14, 3))
+        self.text_label(inner,
+            "Detecta o PS4 e inicia a conversão, inclusive ao entrar no Windows. "
+            "Parar suspende nesta sessão.", size=10, wrap=280).pack(anchor="w")
 
         services = self.card(parent)
         services.pack(fill="x", pady=(0, 5))
@@ -1053,6 +1266,39 @@ class App(ctk.CTk):
         self.bridge.deadzone = value / 100.0
         self.dead_text.configure(text=f"Zona morta radial: {value}%")
 
+    def toggle_auto(self):
+        enable = bool(self.vars['auto'].get())
+        try:
+            set_windows_autostart(enable)
+            save_settings({'auto_convert': enable})
+        except (OSError, ValueError, RuntimeError) as exc:
+            try:
+                set_windows_autostart(self.auto_enabled)  # desfaz registro parcial
+            except OSError:
+                pass
+            self.vars['auto'].set(self.auto_enabled)
+            self.banner(f'Não foi possível salvar a inicialização automática: {exc}', True)
+            return
+        self.auto_enabled = enable
+        self.auto_paused = False
+        self.auto_next_attempt = 0.0
+        if enable:
+            self.banner('Conversão automática ligada. Também iniciará ao entrar no Windows.')
+            self.auto_launch_if_ready()
+            self.scan()
+        else:
+            self.banner('Conversão automática desligada. Use Iniciar para converter manualmente.')
+
+    def auto_launch_if_ready(self):
+        if self.shutdown or not self.auto_enabled or self.auto_paused or self.hide_config_open:
+            return
+        if time.monotonic() < self.auto_next_attempt:
+            return
+        if self.bridge.thread and self.bridge.thread.is_alive():
+            return
+        if self.selected_path and any(d['path'] == self.selected_path for d in self.devices):
+            self.launch(True, automatic=True)
+
     def choose_device(self, label: str):
         self.selected = label
         for i, d in enumerate(self.devices):
@@ -1119,15 +1365,21 @@ class App(ctk.CTk):
             if new_paths!=old_paths:
                 self.banner("Controle detectado. Você já pode iniciar a conversão." if found else
                             "Conecte o controle via USB. Ele aparecerá automaticamente.")
+        # Conversão automática aguarda o fim da enumeração para abrir o HID.
+        if found and not active:
+            self.after(200, self.auto_launch_if_ready)
         # O status real do HidHide é atualizado periodicamente em segundo plano.
 
-    def launch(self, virtual: bool):
+    def launch(self, virtual: bool, automatic: bool = False):
         if self.bridge.thread and self.bridge.thread.is_alive():
             return
         if not self.selected_path or not any(d["path"]==self.selected_path for d in self.devices):
             self.banner("Aguardando controle USB. Ele deve aparecer automaticamente.", True)
             self.scan()
             return
+        if not automatic:
+            # Iniciar manualmente retoma uma automação pausada.
+            self.auto_paused = False
         self.probed.clear()
         self.warning=False
         self.gui_last=None
@@ -1139,6 +1391,7 @@ class App(ctk.CTk):
         self.banner("Abrindo dispositivo USB e preparando a saída..." if virtual else "Preparando teste USB...")
 
     def stop_bridge(self):
+        self.auto_paused = True
         self.bridge.stop.set()
         self.stop.configure(state="disabled")
         self.banner("Desativando Xbox virtual e liberando os comandos...")
@@ -1241,6 +1494,13 @@ class App(ctk.CTk):
         dialog.configure(fg_color=BG)
         dialog.transient(self)
         dialog.grab_set()
+        self.hide_config_open = True
+        def close_hide_dialog():
+            self.hide_config_open = False
+            dialog.destroy()
+            self.after(250, self.scan)
+            self.after(900, self.auto_launch_if_ready)
+        dialog.protocol('WM_DELETE_WINDOW', close_hide_dialog)
         body = ctk.CTkFrame(dialog, fg_color="transparent")
         body.pack(fill="both", expand=True, padx=25, pady=22)
         self.title_label(body, "OCULTAÇÃO DO CONTROLE FÍSICO").pack(anchor="w", pady=(0, 9))
@@ -1274,6 +1534,8 @@ class App(ctk.CTk):
             context["busy"] = True
             if operation != "scan":
                 context["selected_node"] = selected_node
+                idx = context['options'].index(choices.get())
+
             if operation != "scan":
                 status.configure(text="Aplicando configuração do HidHide...", text_color=CYAN)
             def worker():
@@ -1281,7 +1543,8 @@ class App(ctk.CTk):
                     if operation == "scan":
                         result = self.hiding.all_pads()
                     else:
-                        result = self.hiding.set_hidden(selected_node, operation == "hide")
+                        result = apply_hide_checked(self.hiding, selected_node,
+                                                    operation == "hide")
                     self.bridge.events.put(("hide_" + operation, (context, result)))
                 except Exception as exc:
                     self.bridge.events.put(("hide_error", (context, str(exc))))
@@ -1292,10 +1555,12 @@ class App(ctk.CTk):
         self.button(actions, "Ocultar PS4", lambda: async_work("hide"), primary=True).pack(side="left", padx=(0, 8))
         self.button(actions, "Mostrar PS4", lambda: async_work("show")).pack(side="left")
         self.text_label(body,
-            "Após ocultar ou mostrar, reconecte o USB para aplicar a mudança. Configure com o jogo fechado. "
-            "A ocultação permanece ao fechar o aplicativo. Confira o dispositivo antes de ocultá-lo; "
-            "não selecione teclado, mouse nem o Xbox virtual.", wrap=780, size=11).pack(anchor="w")
-        self.button(body, "Concluir", dialog.destroy).pack(side="bottom", anchor="e", pady=(12, 0))
+            "O Windows pode pedir autorização para reiniciar a interface do controle. "
+            "O DS4 Bridge só confirma sucesso ao receber dados USB novamente. "
+            "Se o controle não responder, a ocultação será desfeita quando possível. "
+            "Alguns controles paralelos ainda exigem retirar e recolocar o cabo.",
+            wrap=780, size=11).pack(anchor="w")
+        self.button(body, "Concluir", close_hide_dialog).pack(side="bottom", anchor="e", pady=(12, 0))
 
         def refresh_inventory():
             if not dialog.winfo_exists():
@@ -1359,23 +1624,30 @@ class App(ctk.CTk):
                                           "Aguardando um controle USB compatível..."),
                                     text_color=CYAN if result else AMBER)
             else:
-                cloaked, listed = result
-                label.configure(text=("PS4 incluído no HidHide. Reconecte o USB para aplicar."
-                         if listed else "PS4 removido da lista. Reconecte o USB para aplicar."), text_color=GREEN)
-                # A opção foi gravada, mas ainda não afirmamos que o filtro
-                # está efetivo: é preciso reconectar o USB.
-                if listed and hid_instance_key(context.get('selected_node')) == hid_instance_key(self.selected_path):
-                    self.hide_pending_path = self.selected_path
-                    self.hide_seen_disconnected = False
-                    self.update_hidhide_labels('on')
-                elif listed:
-                    self.hide_pending_path = None
-                    self.update_hidhide_labels('off')
+                self.hide_pending_path = None
+                self.hide_seen_disconnected = False
+                if result['ok']:
+                    label.configure(
+                        text=('PS4 ocultado. O DS4 Bridge confirmou a leitura USB.'
+                              if result['hidden'] else
+                              'PS4 visível novamente. O DS4 Bridge confirmou a leitura USB.'),
+                        text_color=GREEN)
+                    if hid_instance_key(context.get('selected_node')) == hid_instance_key(self.selected_path):
+                        self.update_hidhide_labels('on' if result['hidden'] else 'off')
+                    self.banner('Controle respondendo. Configuração aplicada.')
                 else:
-                    self.hide_pending_path = None
-                    self.hide_seen_disconnected = False
-                    self.update_hidhide_labels('off')
-                self.banner("Configuração salva. Reconecte o controle para aplicar a alteração.")
+                    explanation = ('Ocultação retirada para proteger o acesso ao controle. '
+                                   if result['reverted'] else
+                                   'Não foi possível retirar automaticamente a ocultação. ')
+                    label.configure(
+                        text=('O controle NÃO foi reconectado. ' + explanation +
+                              result['detail'] +
+                              ' Se ainda estiver sem resposta, retire e recoloque o cabo USB.'),
+                        text_color=RED)
+                    if hid_instance_key(context.get('selected_node')) == hid_instance_key(self.selected_path):
+                        self.update_hidhide_labels('off' if result['reverted'] else 'unavailable')
+                    self.banner('Controle sem resposta. Não foi confirmada a reconexão.', True)
+                self.after(350, self.scan)
             return
         if name == "active":
             self.update_hidhide_labels()
@@ -1391,10 +1663,15 @@ class App(ctk.CTk):
         elif name in ("error", "disconnected"):
             self.warning = True
             self.usb.configure(text="●   Falha / desconectado", text_color=RED)
-            self.banner(data, True)
-            if name == "disconnected" and not self.shutdown:
-                self.bell()
-                messagebox.showwarning("DS4 Bridge — controle desconectado", data, parent=self)
+            if self.auto_enabled and not self.auto_paused:
+                # Nunca criar um ciclo intenso quando faltar driver ou cabo.
+                self.auto_next_attempt = time.monotonic() + (12.0 if name == 'error' else 2.5)
+                self.banner(str(data) + ' Nova tentativa automática quando o controle estiver disponível.', True)
+            else:
+                self.banner(data, True)
+                if name == "disconnected" and not self.shutdown:
+                    self.bell()
+                    messagebox.showwarning("DS4 Bridge — controle desconectado", data, parent=self)
         elif name == "stopped":
             self.update_hidhide_labels()
             self.xbox.configure(text="●   Xbox virtual desligado", text_color=MUTED)
@@ -1407,7 +1684,12 @@ class App(ctk.CTk):
             self.after(100, self.scan)
             if not self.warning:
                 self.usb.configure(text="●   Leitura USB parada", text_color=MUTED)
-                self.banner("Parado. O Xbox virtual foi removido.")
+                if self.auto_enabled and not self.auto_paused:
+                    self.banner('Aguardando controle para conversão automática.')
+                elif self.auto_paused and self.auto_enabled:
+                    self.banner('Conversão parada manualmente. Clique em Iniciar para retomar.')
+                else:
+                    self.banner('Parado. O Xbox virtual foi removido.')
 
     def refresh(self):
         for _ in range(25):
@@ -1454,8 +1736,21 @@ class App(ctk.CTk):
 if __name__ == "__main__":
     if sys.platform != "win32":
         raise SystemExit("DS4 Bridge foi desenvolvido exclusivamente para Windows.")
+    # Evita duas emulações Xbox virtuais se o Windows já iniciou o aplicativo.
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+    kernel.CreateMutexW.restype = ctypes.c_void_p
+    mutex = kernel.CreateMutexW(None, False, 'Local\\DS4Bridge_SingleInstance')
+    if mutex and ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        ctypes.windll.user32.MessageBoxW(None,
+            'O DS4 Bridge já está aberto. Verifique a barra de tarefas.',
+            'DS4 Bridge', 0x40)
+        raise SystemExit(0)
     try:
         App().mainloop()
     except Exception as exc:
         exibir_erro_inicio(exc)
         raise SystemExit(1) from exc
+    finally:
+        if mutex:
+            kernel.CloseHandle(ctypes.c_void_p(mutex))
